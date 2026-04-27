@@ -1,7 +1,7 @@
 import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { get, list, put } from "@vercel/blob";
+import { Redis } from "@upstash/redis";
 
 import { clampDifficulty, generatePuzzle, isSolved } from "@/lib/sudoku";
 import {
@@ -22,6 +22,8 @@ const STORAGE_ROOT = process.env.VERCEL
   : path.join(process.cwd(), ".nazoku-data");
 const ROOM_PREFIX = "rooms";
 const PRESENCE_TTL_MS = 30_000;
+
+let redisClient: Redis | null | undefined;
 
 interface RoomMeta {
   roomId: string;
@@ -63,23 +65,23 @@ function isValidRoomCode(input: string) {
   return /^[A-Z2-9]{6}$/.test(input);
 }
 
-function hasBlobToken() {
-  return Boolean(process.env.BLOB_READ_WRITE_TOKEN);
-}
-
-function shouldFallbackToLocalStorage(error: unknown) {
-  if (!error || typeof error !== "object" || !("message" in error)) {
-    return false;
+function getRedisClient() {
+  if (redisClient !== undefined) {
+    return redisClient;
   }
 
-  const message = String(error.message).toLowerCase();
-  return (
-    message.includes("store has been suspended") ||
-    message.includes("store not found") ||
-    message.includes("store does not exist") ||
-    message.includes("403 forbidden") ||
-    message.includes("no vercel blob token found")
-  );
+  const url = process.env.KV_REST_API_URL;
+  const token = process.env.KV_REST_API_TOKEN;
+
+  redisClient = url && token
+    ? new Redis({
+        url,
+        token,
+        readYourWrites: true,
+      })
+    : null;
+
+  return redisClient;
 }
 
 async function writeLocalJson(pathname: string, data: unknown) {
@@ -98,55 +100,81 @@ async function readLocalJson<T>(pathname: string): Promise<T | null> {
   }
 }
 
-async function readBlobJson<T>(pathname: string) {
-  const page = await list({ prefix: pathname, limit: 10 });
-  const blob = page.blobs.find((entry) => entry.pathname === pathname);
+async function writeRedisJson(pathname: string, data: unknown, overwrite: boolean) {
+  const redis = getRedisClient();
 
-  if (!blob) {
-    return null;
+  if (!redis) {
+    throw new Error("KV storage is not configured");
   }
 
-  const result = await get(blob.pathname, { access: "private", useCache: false });
-
-  if (!result || result.statusCode !== 200) {
-    return null;
+  if (overwrite) {
+    await redis.set(pathname, data);
+    return;
   }
 
-  const text = await new Response(result.stream).text();
-  return JSON.parse(text) as T;
+  const created = await redis.setnx(pathname, data);
+
+  if (created !== 1) {
+    throw new Error(`Storage key already exists: ${pathname}`);
+  }
+}
+
+async function readRedisJson<T>(pathname: string): Promise<T | null> {
+  const redis = getRedisClient();
+
+  if (!redis) {
+    throw new Error("KV storage is not configured");
+  }
+
+  const data = await redis.get<T>(pathname);
+  return data ?? null;
+}
+
+async function listRedisJson<T>(prefix: string) {
+  const redis = getRedisClient();
+
+  if (!redis) {
+    throw new Error("KV storage is not configured");
+  }
+
+  const keys: string[] = [];
+  let cursor = "0";
+
+  do {
+    const [nextCursor, batch] = await redis.scan(cursor, {
+      match: `${prefix}*`,
+      count: 200,
+    });
+
+    keys.push(...batch);
+    cursor = nextCursor;
+  } while (cursor !== "0");
+
+  if (keys.length === 0) {
+    return [];
+  }
+
+  const sortedKeys = [...keys].sort((left, right) => left.localeCompare(right));
+  const values = await redis.mget<Array<T | null>>(sortedKeys);
+
+  return sortedKeys.flatMap((pathname, index) => {
+    const data = values[index];
+    return data === null ? [] : [{ pathname, data }];
+  });
 }
 
 async function writeJson(pathname: string, data: unknown, overwrite = true) {
-  const payload = JSON.stringify(data);
-
-  if (hasBlobToken()) {
-    try {
-      await put(pathname, payload, {
-        access: "private",
-        addRandomSuffix: false,
-        allowOverwrite: overwrite,
-        contentType: "application/json",
-      });
-      return;
-    } catch (error) {
-      if (!shouldFallbackToLocalStorage(error)) {
-        throw error;
-      }
-    }
+  if (getRedisClient()) {
+    await writeRedisJson(pathname, data, overwrite);
+    return;
   }
 
   await writeLocalJson(pathname, data);
 }
 
 async function readJson<T>(pathname: string): Promise<T | null> {
-  if (hasBlobToken()) {
-    try {
-      return await readBlobJson<T>(pathname);
-    } catch (error) {
-      if (!shouldFallbackToLocalStorage(error)) {
-        throw error;
-      }
-    }
+  if (getRedisClient()) {
+    return readRedisJson<T>(pathname);
   }
 
   return readLocalJson<T>(pathname);
@@ -175,29 +203,8 @@ async function walkLocal(relativeDirectory = ""): Promise<string[]> {
 }
 
 async function listJson<T>(prefix: string) {
-  if (hasBlobToken()) {
-    try {
-      let cursor: string | undefined;
-      const items: Array<{ pathname: string; data: T }> = [];
-
-      do {
-        const page = await list({ prefix, cursor });
-        const chunk = await Promise.all(
-          page.blobs.map(async (blob) => {
-            const data = await readBlobJson<T>(blob.pathname);
-            return data ? { pathname: blob.pathname, data } : null;
-          }),
-        );
-        items.push(...chunk.filter(Boolean) as Array<{ pathname: string; data: T }>);
-        cursor = page.hasMore ? page.cursor : undefined;
-      } while (cursor);
-
-      return items;
-    } catch (error) {
-      if (!shouldFallbackToLocalStorage(error)) {
-        throw error;
-      }
-    }
+  if (getRedisClient()) {
+    return listRedisJson<T>(prefix);
   }
 
   const files = (await walkLocal()).filter((pathname) => pathname.startsWith(prefix));
