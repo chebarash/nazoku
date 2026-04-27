@@ -241,7 +241,7 @@ function useRoom(
       }
 
       try {
-        const response = await fetch(`/api/rooms/${roomId}`, { cache: "no-store" });
+        const response = await fetch(`/api/game?roomId=${roomId}`, { cache: "no-store" });
 
         if (!response.ok) {
           throw new Error("Room not found");
@@ -293,10 +293,14 @@ function useRoom(
     }
 
     async function ping() {
-      await fetch(`/api/rooms/${roomId}/presence`, {
+      await fetch("/api/game", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(player),
+        body: JSON.stringify({
+          action: "presence",
+          roomId,
+          ...player,
+        }),
       });
     }
 
@@ -318,7 +322,7 @@ function useRoom(
     setLoading(true);
 
     try {
-      const response = await fetch(`/api/rooms/${roomId}`, { cache: "no-store" });
+      const response = await fetch(`/api/game?roomId=${roomId}`, { cache: "no-store" });
 
       if (!response.ok) {
         throw new Error("Room not found");
@@ -503,12 +507,16 @@ export function NazokuApp() {
       }
     }
 
-    const response = await fetch(`/api/rooms/${roomId}/events`, {
+    const response = await fetch("/api/game", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        ...payload,
-        actor: player,
+        action: "room-event",
+        roomId,
+        payload: {
+          ...payload,
+          actor: player,
+        },
       }),
     });
 
@@ -551,12 +559,16 @@ export function NazokuApp() {
         }
       }
 
-      const response = await fetch(`/api/rooms/${roomId}/events`, {
+      const response = await fetch("/api/game", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          ...payload,
-          actor: player,
+          action: "room-event",
+          roomId,
+          payload: {
+            ...payload,
+            actor: player,
+          },
         }),
       });
 
@@ -677,10 +689,11 @@ export function NazokuApp() {
     setPending(true);
 
     try {
-      const response = await fetch("/api/rooms", {
+      const response = await fetch("/api/game", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          action: "create-room",
           playerName: normalized,
           difficulty,
         }),
@@ -731,10 +744,12 @@ export function NazokuApp() {
     setPending(true);
 
     try {
-      const response = await fetch(`/api/rooms/${targetRoom}/join`, {
+      const response = await fetch("/api/game", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          action: "join-room",
+          roomId: targetRoom,
           playerName: normalizedName,
         }),
       });

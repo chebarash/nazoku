@@ -17,7 +17,9 @@ import {
   RoomState,
 } from "@/lib/types";
 
-const STORAGE_ROOT = path.join(process.cwd(), ".nazoku-data");
+const STORAGE_ROOT = process.env.VERCEL
+  ? "/tmp/nazoku-data"
+  : path.join(process.cwd(), ".nazoku-data");
 const ROOM_PREFIX = "rooms";
 const PRESENCE_TTL_MS = 30_000;
 
@@ -65,6 +67,37 @@ function hasBlobToken() {
   return Boolean(process.env.BLOB_READ_WRITE_TOKEN);
 }
 
+function shouldFallbackToLocalStorage(error: unknown) {
+  if (!error || typeof error !== "object" || !("message" in error)) {
+    return false;
+  }
+
+  const message = String(error.message).toLowerCase();
+  return (
+    message.includes("store has been suspended") ||
+    message.includes("store not found") ||
+    message.includes("store does not exist") ||
+    message.includes("403 forbidden") ||
+    message.includes("no vercel blob token found")
+  );
+}
+
+async function writeLocalJson(pathname: string, data: unknown) {
+  const target = path.join(STORAGE_ROOT, pathname);
+  await mkdir(path.dirname(target), { recursive: true });
+  await writeFile(target, JSON.stringify(data), "utf8");
+}
+
+async function readLocalJson<T>(pathname: string): Promise<T | null> {
+  try {
+    const target = path.join(STORAGE_ROOT, pathname);
+    const payload = await readFile(target, "utf8");
+    return JSON.parse(payload) as T;
+  } catch {
+    return null;
+  }
+}
+
 async function readBlobJson<T>(pathname: string) {
   const page = await list({ prefix: pathname, limit: 10 });
   const blob = page.blobs.find((entry) => entry.pathname === pathname);
@@ -87,32 +120,36 @@ async function writeJson(pathname: string, data: unknown, overwrite = true) {
   const payload = JSON.stringify(data);
 
   if (hasBlobToken()) {
-    await put(pathname, payload, {
-      access: "private",
-      addRandomSuffix: false,
-      allowOverwrite: overwrite,
-      contentType: "application/json",
-    });
-    return;
+    try {
+      await put(pathname, payload, {
+        access: "private",
+        addRandomSuffix: false,
+        allowOverwrite: overwrite,
+        contentType: "application/json",
+      });
+      return;
+    } catch (error) {
+      if (!shouldFallbackToLocalStorage(error)) {
+        throw error;
+      }
+    }
   }
 
-  const target = path.join(STORAGE_ROOT, pathname);
-  await mkdir(path.dirname(target), { recursive: true });
-  await writeFile(target, payload, "utf8");
+  await writeLocalJson(pathname, data);
 }
 
 async function readJson<T>(pathname: string): Promise<T | null> {
   if (hasBlobToken()) {
-    return readBlobJson<T>(pathname);
+    try {
+      return await readBlobJson<T>(pathname);
+    } catch (error) {
+      if (!shouldFallbackToLocalStorage(error)) {
+        throw error;
+      }
+    }
   }
 
-  try {
-    const target = path.join(STORAGE_ROOT, pathname);
-    const payload = await readFile(target, "utf8");
-    return JSON.parse(payload) as T;
-  } catch {
-    return null;
-  }
+  return readLocalJson<T>(pathname);
 }
 
 async function walkLocal(relativeDirectory = ""): Promise<string[]> {
@@ -139,22 +176,28 @@ async function walkLocal(relativeDirectory = ""): Promise<string[]> {
 
 async function listJson<T>(prefix: string) {
   if (hasBlobToken()) {
-    let cursor: string | undefined;
-    const items: Array<{ pathname: string; data: T }> = [];
+    try {
+      let cursor: string | undefined;
+      const items: Array<{ pathname: string; data: T }> = [];
 
-    do {
-      const page = await list({ prefix, cursor });
-      const chunk = await Promise.all(
-        page.blobs.map(async (blob) => {
-          const data = await readBlobJson<T>(blob.pathname);
-          return data ? { pathname: blob.pathname, data } : null;
-        }),
-      );
-      items.push(...chunk.filter(Boolean) as Array<{ pathname: string; data: T }>);
-      cursor = page.hasMore ? page.cursor : undefined;
-    } while (cursor);
+      do {
+        const page = await list({ prefix, cursor });
+        const chunk = await Promise.all(
+          page.blobs.map(async (blob) => {
+            const data = await readBlobJson<T>(blob.pathname);
+            return data ? { pathname: blob.pathname, data } : null;
+          }),
+        );
+        items.push(...chunk.filter(Boolean) as Array<{ pathname: string; data: T }>);
+        cursor = page.hasMore ? page.cursor : undefined;
+      } while (cursor);
 
-    return items;
+      return items;
+    } catch (error) {
+      if (!shouldFallbackToLocalStorage(error)) {
+        throw error;
+      }
+    }
   }
 
   const files = (await walkLocal()).filter((pathname) => pathname.startsWith(prefix));
