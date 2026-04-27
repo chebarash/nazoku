@@ -66,7 +66,14 @@ function hasBlobToken() {
 }
 
 async function readBlobJson<T>(pathname: string) {
-  const result = await get(pathname, { access: "private", useCache: false });
+  const page = await list({ prefix: pathname, limit: 10 });
+  const blob = page.blobs.find((entry) => entry.pathname === pathname);
+
+  if (!blob) {
+    return null;
+  }
+
+  const result = await get(blob.pathname, { access: "private", useCache: false });
 
   if (!result || result.statusCode !== 200) {
     return null;
