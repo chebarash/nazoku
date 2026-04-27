@@ -11,6 +11,9 @@ interface SudokuBoardProps {
   onSelectCell: (index: number) => void;
 }
 
+const COLUMN_LABELS = ["1", "2", "3", "4", "5", "6", "7", "8", "9"];
+const ROW_LABELS = ["A", "B", "C", "D", "E", "F", "G", "H", "I"];
+
 function neighbors(a: number, b: number) {
   const rowA = Math.floor(a / 9);
   const columnA = a % 9;
@@ -44,71 +47,85 @@ export function SudokuBoard({
   onSelectCell,
 }: SudokuBoardProps) {
   return (
-    <div className="board-shell">
-      <div className="board-grid" role="grid" aria-label="Shared Sudoku board">
-        {room.board.map((value, index) => {
-          const player = room.players.find(
-            (candidate) => candidate.playerId === room.cellOwners[index],
-          );
-          const isGiven = room.givens[index];
-          const isSelected = selectedCell === index;
-          const isNeighbor =
-            selectedCell !== null && !isSelected && neighbors(selectedCell, index);
-          const isSameValue =
-            selectedCell !== null && !isSelected && valueMatch(room, selectedCell, index);
-          const isWrong = value !== null && value !== room.solution[index];
-          const notes = room.notes[index];
+    <div className="board-frame">
+      <div className="board-axis board-axis-top" aria-hidden="true">
+        {COLUMN_LABELS.map((label) => (
+          <span key={label}>{label}</span>
+        ))}
+      </div>
 
-          return (
-            <button
-              key={index}
-              className={[
-                "cell",
-                isGiven ? "cell-given" : "",
-                isSelected ? "cell-selected" : "",
-                isNeighbor ? "cell-neighbor" : "",
-                isSameValue ? "cell-same-value" : "",
-                isWrong ? "cell-wrong" : "",
-              ]
-                .filter(Boolean)
-                .join(" ")}
-              style={
-                player
-                  ? {
-                      "--cell-accent": player.playerColor,
-                    } as CSSProperties
-                  : undefined
-              }
-              onClick={() => onSelectCell(index)}
-              aria-label={`Cell ${index + 1}`}
-              type="button"
-            >
-              {value !== null ? (
-                <span className="cell-value">{value}</span>
-              ) : (
-                <span className="cell-notes" aria-hidden="true">
-                  {Array.from({ length: 9 }, (_, noteIndex) => noteIndex + 1).map((note) => (
-                    <span key={note} className="cell-note">
-                      {notes.includes(note) ? note : ""}
-                    </span>
-                  ))}
-                </span>
-              )}
+      <div className="board-axis board-axis-side" aria-hidden="true">
+        {ROW_LABELS.map((label) => (
+          <span key={label}>{label}</span>
+        ))}
+      </div>
 
-              {player ? (
-                <span
-                  className="cell-owner"
-                  style={{ backgroundColor: player.playerColor }}
-                  aria-hidden="true"
-                />
-              ) : null}
+      <div className="board-shell">
+        <div className="board-grid" role="grid" aria-label="Shared Sudoku board">
+          {room.board.map((value, index) => {
+            const player = room.players.find(
+              (candidate) => candidate.playerId === room.cellOwners[index],
+            );
+            const isGiven = room.givens[index];
+            const isSelected = selectedCell === index;
+            const isNeighbor =
+              selectedCell !== null && !isSelected && neighbors(selectedCell, index);
+            const isSameValue =
+              selectedCell !== null && !isSelected && valueMatch(room, selectedCell, index);
+            const isWrong = value !== null && value !== room.solution[index];
+            const notes = room.notes[index];
 
-              {selfPlayer && room.cellOwners[index] === selfPlayer.playerId ? (
-                <span className="sr-only">Last touched by you</span>
-              ) : null}
-            </button>
-          );
-        })}
+            return (
+              <button
+                key={index}
+                className={[
+                  "cell",
+                  isGiven ? "cell-given" : "",
+                  isSelected ? "cell-selected" : "",
+                  isNeighbor ? "cell-neighbor" : "",
+                  isSameValue ? "cell-same-value" : "",
+                  isWrong ? "cell-wrong" : "",
+                ]
+                  .filter(Boolean)
+                  .join(" ")}
+                style={
+                  player
+                    ? ({
+                        "--cell-accent": player.playerColor,
+                      } as CSSProperties)
+                    : undefined
+                }
+                onClick={() => onSelectCell(index)}
+                aria-label={`Cell ${index + 1}`}
+                type="button"
+              >
+                {value !== null ? (
+                  <span className="cell-value">{value}</span>
+                ) : (
+                  <span className="cell-notes" aria-hidden="true">
+                    {Array.from({ length: 9 }, (_, noteIndex) => noteIndex + 1).map((note) => (
+                      <span key={note} className="cell-note">
+                        {notes.includes(note) ? note : ""}
+                      </span>
+                    ))}
+                  </span>
+                )}
+
+                {player ? (
+                  <span
+                    className="cell-owner"
+                    style={{ backgroundColor: player.playerColor }}
+                    aria-hidden="true"
+                  />
+                ) : null}
+
+                {selfPlayer && room.cellOwners[index] === selfPlayer.playerId ? (
+                  <span className="sr-only">Last touched by you</span>
+                ) : null}
+              </button>
+            );
+          })}
+        </div>
       </div>
     </div>
   );

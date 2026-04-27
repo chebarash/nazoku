@@ -2,16 +2,18 @@
 
 import {
   ArrowLeft,
+  Check,
   Copy,
   Crown,
   LoaderCircle,
+  LogIn,
   Plus,
   RefreshCcw,
   SquarePen,
   Users,
   X,
 } from "lucide-react";
-import { startTransition, useEffect, useState } from "react";
+import { startTransition, useEffect, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 
 import { SudokuBoard } from "@/components/sudoku-board";
@@ -25,6 +27,24 @@ import {
 
 const NAME_KEY = "nazoku.display-name";
 const SESSION_KEY_PREFIX = "nazoku.session.";
+
+type EntryScreen = "name" | "lobby";
+type LobbyMode = "create" | "join";
+type ToastTone = "neutral" | "success" | "error" | "event";
+type BoardActionPayload =
+  | { action: "cell-set"; index: number; value: number | null }
+  | { action: "note-toggle"; index: number; value: number };
+
+interface ToastItem {
+  id: string;
+  message: string;
+  tone: ToastTone;
+}
+
+interface UseRoomOptions {
+  onRoomData?: (room: RoomState) => void;
+  onSyncError?: (message: string) => void;
+}
 
 function sessionKey(roomId: string) {
   return `${SESSION_KEY_PREFIX}${roomId}`;
@@ -48,6 +68,23 @@ function writeStoredSession(roomId: string, player: PlayerSession) {
   window.localStorage.setItem(sessionKey(roomId), JSON.stringify(player));
 }
 
+function normalizeName(input: string) {
+  return input.trim().replace(/\s+/g, " ").slice(0, 18);
+}
+
+function normalizeRoomCode(input: string) {
+  return input.toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 6);
+}
+
+function cellLabel(index: number) {
+  return `${String.fromCharCode(65 + Math.floor(index / 9))}${(index % 9) + 1}`;
+}
+
+function firstEditableCell(room: RoomState) {
+  const index = room.givens.findIndex((value) => !value);
+  return index === -1 ? 0 : index;
+}
+
 function formatTime(input: string) {
   return new Intl.DateTimeFormat(undefined, {
     hour: "2-digit",
@@ -65,16 +102,127 @@ function progressPercent(room: RoomState) {
 
 function loadStoredName() {
   if (typeof window === "undefined") {
-    return "Player";
+    return "";
   }
 
-  return window.localStorage.getItem(NAME_KEY) ?? "Player";
+  return window.localStorage.getItem(NAME_KEY) ?? "";
 }
 
-function useRoom(roomId: string | null, player: PlayerSession | null) {
+function makeToastId() {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+
+  return `toast-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function applyOptimisticRoom(
+  room: RoomState,
+  actor: PlayerSession,
+  payload: BoardActionPayload,
+) {
+  if (room.completedAt) {
+    return room;
+  }
+
+  if (payload.index < 0 || payload.index >= 81 || room.givens[payload.index]) {
+    return room;
+  }
+
+  const now = new Date().toISOString();
+  const nextPlayers = room.players.map((entry) => ({ ...entry }));
+  const nextBoard = [...room.board];
+  const nextNotes = [...room.notes];
+  const nextCellOwners = [...room.cellOwners];
+  const nextCellUpdatedAt = [...room.cellUpdatedAt];
+
+  if (payload.action === "cell-set") {
+    if (nextBoard[payload.index] === payload.value) {
+      return room;
+    }
+
+    const actorRow = nextPlayers.find((entry) => entry.playerId === actor.playerId);
+
+    if (actorRow) {
+      actorRow.moveCount += 1;
+
+      if (payload.value !== null) {
+        if (
+          room.solution[payload.index] === payload.value &&
+          nextBoard[payload.index] !== room.solution[payload.index]
+        ) {
+          actorRow.correctMoves += 1;
+        } else if (room.solution[payload.index] !== payload.value) {
+          actorRow.errors += 1;
+        }
+      }
+    }
+
+    nextBoard[payload.index] = payload.value;
+    nextNotes[payload.index] = [];
+    nextCellOwners[payload.index] = actor.playerId;
+    nextCellUpdatedAt[payload.index] = now;
+  }
+
+  if (payload.action === "note-toggle") {
+    if (nextBoard[payload.index] !== null) {
+      return room;
+    }
+
+    const currentNotes = new Set(nextNotes[payload.index]);
+
+    if (currentNotes.has(payload.value)) {
+      currentNotes.delete(payload.value);
+    } else {
+      currentNotes.add(payload.value);
+    }
+
+    nextNotes[payload.index] = [...currentNotes].sort((left, right) => left - right);
+    nextCellOwners[payload.index] = actor.playerId;
+    nextCellUpdatedAt[payload.index] = now;
+  }
+
+  const nextFilledCells = nextBoard.filter((value) => value !== null).length;
+  const nextCorrectCells = nextBoard.filter(
+    (value, index) => value !== null && value === room.solution[index],
+  ).length;
+  const solved = nextBoard.every((value, index) => value === room.solution[index]);
+
+  return {
+    ...room,
+    board: nextBoard,
+    notes: nextNotes,
+    cellOwners: nextCellOwners,
+    cellUpdatedAt: nextCellUpdatedAt,
+    players: nextPlayers,
+    filledCells: nextFilledCells,
+    correctCells: nextCorrectCells,
+    completedAt: solved ? now : room.completedAt,
+    winner: solved
+      ? {
+          playerId: actor.playerId,
+          playerName: actor.playerName,
+          playerColor: actor.playerColor,
+        }
+      : room.winner,
+  };
+}
+
+function useRoom(
+  roomId: string | null,
+  player: PlayerSession | null,
+  options: UseRoomOptions = {},
+) {
   const [room, setRoom] = useState<RoomState | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const roomHandlerRef = useRef(options.onRoomData);
+  const errorHandlerRef = useRef(options.onSyncError);
+
+  useEffect(() => {
+    roomHandlerRef.current = options.onRoomData;
+    errorHandlerRef.current = options.onSyncError;
+  }, [options.onRoomData, options.onSyncError]);
 
   useEffect(() => {
     if (!roomId) {
@@ -105,6 +253,7 @@ function useRoom(roomId: string | null, player: PlayerSession | null) {
           return;
         }
 
+        roomHandlerRef.current?.(payload.room);
         startTransition(() => {
           setRoom(payload.room);
           setError(null);
@@ -114,8 +263,11 @@ function useRoom(roomId: string | null, player: PlayerSession | null) {
           return;
         }
 
-        setError(fetchError instanceof Error ? fetchError.message : "Failed to sync room");
+        const message =
+          fetchError instanceof Error ? fetchError.message : "Failed to sync room";
+        setError(message);
         setRoom(null);
+        errorHandlerRef.current?.(message);
       } finally {
         if (!silent && active) {
           setLoading(false);
@@ -173,13 +325,16 @@ function useRoom(roomId: string | null, player: PlayerSession | null) {
       }
 
       const payload = (await response.json()) as { room: RoomState };
+      roomHandlerRef.current?.(payload.room);
       startTransition(() => {
         setRoom(payload.room);
         setError(null);
       });
     } catch (fetchError) {
-      setError(fetchError instanceof Error ? fetchError.message : "Failed to sync room");
+      const message = fetchError instanceof Error ? fetchError.message : "Failed to sync room";
+      setError(message);
       setRoom(null);
+      errorHandlerRef.current?.(message);
     } finally {
       setLoading(false);
     }
@@ -193,7 +348,9 @@ export function NazokuApp() {
   const searchParams = useSearchParams();
   const roomId = searchParams.get("room")?.toUpperCase() ?? null;
   const [displayName, setDisplayName] = useState(loadStoredName);
-  const [joinCode, setJoinCode] = useState("");
+  const [entryScreen, setEntryScreen] = useState<EntryScreen>("name");
+  const [lobbyMode, setLobbyMode] = useState<LobbyMode>(roomId ? "join" : "create");
+  const [joinCode, setJoinCode] = useState(() => roomId ?? "");
   const [difficulty, setDifficulty] = useState<Difficulty>("medium");
   const [storedSessions, setStoredSessions] = useState<Record<string, PlayerSession>>(() => {
     if (typeof window === "undefined" || !roomId) {
@@ -206,38 +363,144 @@ export function NazokuApp() {
   const [selectedCell, setSelectedCell] = useState<number | null>(0);
   const [notesMode, setNotesMode] = useState(false);
   const [pending, setPending] = useState(false);
-  const [notice, setNotice] = useState<string | null>(null);
+  const [toasts, setToasts] = useState<ToastItem[]>([]);
+  const toastTimersRef = useRef<Map<string, number>>(new Map());
+  const pushToastRef = useRef<(message: string, tone?: ToastTone) => void>(() => undefined);
+  const ingestRoomRef = useRef<(room: RoomState, prime?: boolean) => void>(() => undefined);
+  const roomTrackerRef = useRef<{
+    roomId: string | null;
+    seenActivityIds: Set<string>;
+    completedAt: string | null;
+    lastError: string | null;
+  }>({
+    roomId: null,
+    seenActivityIds: new Set(),
+    completedAt: null,
+    lastError: null,
+  });
+
   const player = roomId ? storedSessions[roomId] ?? readStoredSession(roomId) : null;
-  const { room, loading, error, refresh, setRoom } = useRoom(roomId, player);
+
+  function dismissToast(id: string) {
+    const timer = toastTimersRef.current.get(id);
+
+    if (timer) {
+      window.clearTimeout(timer);
+      toastTimersRef.current.delete(id);
+    }
+
+    setToasts((current) => current.filter((item) => item.id !== id));
+  }
+
+  function pushToast(message: string, tone: ToastTone = "neutral") {
+    const id = makeToastId();
+    const nextToast = { id, message, tone };
+
+    setToasts((current) => [...current.slice(-2), nextToast]);
+
+    const timer = window.setTimeout(() => {
+      dismissToast(id);
+    }, 3200);
+
+    toastTimersRef.current.set(id, timer);
+  }
+
+  function ingestRoom(nextRoom: RoomState, prime = false) {
+    const tracker = roomTrackerRef.current;
+    tracker.lastError = null;
+
+    if (prime || tracker.roomId !== nextRoom.roomId) {
+      tracker.roomId = nextRoom.roomId;
+      tracker.seenActivityIds = new Set(nextRoom.activity.map((item) => item.id));
+      tracker.completedAt = nextRoom.completedAt;
+      return;
+    }
+
+    const unseen = nextRoom.activity
+      .filter((item) => !tracker.seenActivityIds.has(item.id))
+      .reverse();
+
+    for (const item of unseen) {
+      tracker.seenActivityIds.add(item.id);
+      pushToast(item.label, "event");
+    }
+
+    if (
+      nextRoom.completedAt &&
+      tracker.completedAt !== nextRoom.completedAt &&
+      nextRoom.winner
+    ) {
+      pushToast(`${nextRoom.winner.playerName} closed the grid.`, "success");
+    }
+
+    tracker.completedAt = nextRoom.completedAt;
+  }
+
+  function handleSyncError(message: string) {
+    if (roomTrackerRef.current.lastError === message) {
+      return;
+    }
+
+    roomTrackerRef.current.lastError = message;
+    pushToast(message, "error");
+  }
+
+  const { room, loading, error, refresh, setRoom } = useRoom(roomId, player, {
+    onRoomData: (nextRoom) => ingestRoom(nextRoom),
+    onSyncError: handleSyncError,
+  });
+
+  useEffect(() => {
+    pushToastRef.current = pushToast;
+    ingestRoomRef.current = ingestRoom;
+  });
 
   useEffect(() => {
     window.localStorage.setItem(NAME_KEY, displayName);
   }, [displayName]);
+
+  useEffect(() => {
+    const timers = toastTimersRef.current;
+
+    return () => {
+      for (const timer of timers.values()) {
+        window.clearTimeout(timer);
+      }
+    };
+  }, []);
 
   const selfPlayer =
     room && player
       ? room.players.find((candidate) => candidate.playerId === player.playerId) ?? null
       : null;
 
+  const view = roomId && player ? "room" : entryScreen;
+  const liveRoom = roomId ? room : null;
+  const connectedCount = liveRoom?.players.filter((candidate) => candidate.connected).length ?? 0;
+  const selectedValue =
+    room && selectedCell !== null ? room.board[selectedCell] ?? "Empty" : "Empty";
+  const selectedNotes =
+    room && selectedCell !== null ? room.notes[selectedCell].join(" ") : "";
+
   async function performAction(
     payload:
-      | {
-          action: "cell-set";
-          index: number;
-          value: number | null;
-        }
-      | {
-          action: "note-toggle";
-          index: number;
-          value: number;
-        }
-      | {
-          action: "new-game";
-          difficulty: Difficulty;
-        },
+      | BoardActionPayload
+      | { action: "new-game"; difficulty: Difficulty },
   ) {
     if (!roomId || !player) {
       return;
+    }
+
+    const snapshot = room;
+
+    if (snapshot && payload.action !== "new-game") {
+      const optimisticRoom = applyOptimisticRoom(snapshot, player, payload);
+
+      if (optimisticRoom !== snapshot) {
+        startTransition(() => {
+          setRoom(optimisticRoom);
+        });
+      }
     }
 
     const response = await fetch(`/api/rooms/${roomId}/events`, {
@@ -250,10 +513,19 @@ export function NazokuApp() {
     });
 
     if (!response.ok) {
-      throw new Error("Action failed");
+      pushToast("Action failed", "error");
+
+      if (snapshot) {
+        startTransition(() => {
+          setRoom(snapshot);
+        });
+      }
+
+      return;
     }
 
     const next = (await response.json()) as { room: RoomState };
+    ingestRoom(next.room);
     startTransition(() => {
       setRoom(next.room);
     });
@@ -261,12 +533,22 @@ export function NazokuApp() {
 
   useEffect(() => {
     async function sendKeyAction(
-      payload:
-        | { action: "cell-set"; index: number; value: number | null }
-        | { action: "note-toggle"; index: number; value: number },
+      payload: BoardActionPayload,
     ) {
       if (!roomId || !player) {
         return;
+      }
+
+      const snapshot = room;
+
+      if (snapshot) {
+        const optimisticRoom = applyOptimisticRoom(snapshot, player, payload);
+
+        if (optimisticRoom !== snapshot) {
+          startTransition(() => {
+            setRoom(optimisticRoom);
+          });
+        }
       }
 
       const response = await fetch(`/api/rooms/${roomId}/events`, {
@@ -279,10 +561,19 @@ export function NazokuApp() {
       });
 
       if (!response.ok) {
+        pushToastRef.current("Action failed", "error");
+
+        if (snapshot) {
+          startTransition(() => {
+            setRoom(snapshot);
+          });
+        }
+
         return;
       }
 
       const next = (await response.json()) as { room: RoomState };
+      ingestRoomRef.current(next.room);
       startTransition(() => {
         setRoom(next.room);
       });
@@ -357,16 +648,40 @@ export function NazokuApp() {
     };
   }, [notesMode, player, room, roomId, selectedCell, setRoom]);
 
+  function continueToLobby() {
+    const normalized = normalizeName(displayName);
+
+    if (!normalized) {
+      pushToast("Enter a nickname", "error");
+      return;
+    }
+
+    setDisplayName(normalized);
+    setEntryScreen("lobby");
+
+    if (roomId) {
+      setLobbyMode("join");
+      setJoinCode(roomId);
+    }
+  }
+
   async function createRoom() {
+    const normalized = normalizeName(displayName);
+
+    if (!normalized) {
+      pushToast("Enter a nickname", "error");
+      setEntryScreen("name");
+      return;
+    }
+
     setPending(true);
-    setNotice(null);
 
     try {
       const response = await fetch("/api/rooms", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          playerName: displayName,
+          playerName: normalized,
           difficulty,
         }),
       });
@@ -381,36 +696,46 @@ export function NazokuApp() {
         ...current,
         [payload.roomId]: payload.player,
       }));
+      ingestRoom(payload.room, true);
       startTransition(() => {
         setRoom(payload.room);
       });
-      router.replace(`/?room=${payload.roomId}`);
-      setSelectedCell(0);
+      setDisplayName(normalized);
+      setSelectedCell(firstEditableCell(payload.room));
       setJoinCode(payload.roomId);
+      setNotesMode(false);
+      router.replace(`/?room=${payload.roomId}`);
+      pushToast(`Room ${payload.roomId} is live`, "success");
     } catch (createError) {
-      setNotice(createError instanceof Error ? createError.message : "Create failed");
+      pushToast(createError instanceof Error ? createError.message : "Create failed", "error");
     } finally {
       setPending(false);
     }
   }
 
   async function joinRoom() {
-    const targetRoom = joinCode.trim().toUpperCase();
+    const normalizedName = normalizeName(displayName);
+    const targetRoom = normalizeRoomCode(joinCode || roomId || "");
+
+    if (!normalizedName) {
+      pushToast("Enter a nickname", "error");
+      setEntryScreen("name");
+      return;
+    }
 
     if (!targetRoom) {
-      setNotice("Enter a room code");
+      pushToast("Enter a room code", "error");
       return;
     }
 
     setPending(true);
-    setNotice(null);
 
     try {
       const response = await fetch(`/api/rooms/${targetRoom}/join`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          playerName: displayName,
+          playerName: normalizedName,
         }),
       });
 
@@ -424,13 +749,18 @@ export function NazokuApp() {
         ...current,
         [payload.roomId]: payload.player,
       }));
+      ingestRoom(payload.room, true);
       startTransition(() => {
         setRoom(payload.room);
       });
+      setDisplayName(normalizedName);
+      setSelectedCell(firstEditableCell(payload.room));
+      setJoinCode(payload.roomId);
+      setNotesMode(false);
       router.replace(`/?room=${payload.roomId}`);
-      setSelectedCell(0);
+      pushToast(`Joined room ${payload.roomId}`, "success");
     } catch (joinError) {
-      setNotice(joinError instanceof Error ? joinError.message : "Join failed");
+      pushToast(joinError instanceof Error ? joinError.message : "Join failed", "error");
     } finally {
       setPending(false);
     }
@@ -443,7 +773,7 @@ export function NazokuApp() {
 
     const url = `${window.location.origin}/?room=${roomId}`;
     await navigator.clipboard.writeText(url);
-    setNotice("Link copied");
+    pushToast("Invite link copied", "success");
   }
 
   async function pressDigit(value: number | null) {
@@ -467,137 +797,222 @@ export function NazokuApp() {
     await performAction({ action: "new-game", difficulty: nextDifficulty });
     setDifficulty(nextDifficulty);
     setSelectedCell(0);
+    setNotesMode(false);
+    pushToast(`${DIFFICULTY_META[nextDifficulty].label} grid loaded`, "neutral");
   }
 
   function leaveRoom() {
-    router.replace("/");
+    roomTrackerRef.current = {
+      roomId: null,
+      seenActivityIds: new Set(),
+      completedAt: null,
+      lastError: null,
+    };
+    setEntryScreen("lobby");
+    setLobbyMode("create");
     setJoinCode("");
-    setNotice(null);
     setSelectedCell(0);
+    setNotesMode(false);
+    router.replace("/");
   }
 
-  const showJoinOverlay = Boolean(roomId && !player);
-  const connectedCount = room?.players.filter((candidate) => candidate.connected).length ?? 0;
+  function backToName() {
+    setEntryScreen("name");
+  }
 
   return (
     <main className="page-shell">
-      <div className="ambient ambient-left" aria-hidden="true" />
-      <div className="ambient ambient-right" aria-hidden="true" />
+      <div className="page-glow page-glow-left" aria-hidden="true" />
+      <div className="page-glow page-glow-right" aria-hidden="true" />
 
-      <section className="workspace">
-        <header className="topbar">
-          <div className="brand-block">
-            <span className="brand-mark">Nazoku</span>
-            <p className="brand-copy">
-              Multiplayer Sudoku lounge for fast rooms, shared pencil marks and
-              live board pressure.
-            </p>
+      {view === "name" ? (
+        <section className="entry-screen">
+          <div className="entry-pane">
+            <span className="entry-mark">Nazoku</span>
+            <p className="entry-submark">Shared Sudoku</p>
+
+            <label className="field">
+              <span>Nickname</span>
+              <input
+                autoFocus
+                maxLength={18}
+                placeholder="Player"
+                value={displayName}
+                onChange={(event) => setDisplayName(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    continueToLobby();
+                  }
+                }}
+              />
+            </label>
+
+            <button className="primary-button wide-button" type="button" onClick={continueToLobby}>
+              <Check size={16} />
+              <span>Continue</span>
+            </button>
           </div>
+        </section>
+      ) : null}
 
-          <div className="topbar-actions">
-            {roomId ? (
-              <>
-                <button className="icon-button" type="button" onClick={copyRoomLink}>
-                  <Copy size={16} />
-                  <span>{roomId}</span>
-                </button>
-                <button className="icon-button" type="button" onClick={leaveRoom}>
-                  <ArrowLeft size={16} />
-                  <span>Lobby</span>
-                </button>
-              </>
-            ) : null}
-          </div>
-        </header>
-
-        <section className="grid-layout">
-          <section className="panel">
-            <div className="panel-head">
-              <span className="eyebrow">Session</span>
-              <div className="pulse-row">
-                <Users size={16} />
-                <span>{connectedCount} online</span>
+      {view === "lobby" ? (
+        <section className="entry-screen">
+          <div className="lobby-pane">
+            <div className="lobby-head">
+              <div>
+                <span className="entry-mark compact-mark">Nazoku</span>
+                <p className="entry-submark">{normalizeName(displayName) || "Player"}</p>
               </div>
-            </div>
 
-            <div className="identity-block">
-              <label className="field">
-                <span>Name</span>
-                <input
-                  value={displayName}
-                  onChange={(event) => setDisplayName(event.target.value)}
-                  maxLength={18}
-                  placeholder="Player"
-                />
-              </label>
-
-              <label className="field">
-                <span>Room code</span>
-                <input
-                  value={joinCode}
-                  onChange={(event) => setJoinCode(event.target.value.toUpperCase())}
-                  maxLength={6}
-                  placeholder="AB12CD"
-                />
-              </label>
-            </div>
-
-            <div className="segmented">
-              {(Object.keys(DIFFICULTY_META) as Difficulty[]).map((option) => (
-                <button
-                  key={option}
-                  type="button"
-                  className={option === difficulty ? "segment active" : "segment"}
-                  onClick={() => setDifficulty(option)}
-                >
-                  <span>{DIFFICULTY_META[option].label}</span>
-                  <small>{DIFFICULTY_META[option].pulse}</small>
-                </button>
-              ))}
-            </div>
-
-            <div className="action-stack">
-              <button className="primary-button" type="button" onClick={createRoom} disabled={pending}>
-                {pending ? <LoaderCircle className="spin" size={16} /> : <Plus size={16} />}
-                <span>Create room</span>
-              </button>
-              <button className="secondary-button" type="button" onClick={joinRoom} disabled={pending}>
+              <button className="icon-button subtle" type="button" onClick={backToName}>
                 <SquarePen size={16} />
-                <span>Join room</span>
+                <span>Edit</span>
               </button>
             </div>
 
-            {room ? (
-              <div className="score-strip">
-                <div>
-                  <span className="metric-label">Solved</span>
-                  <strong>{progressPercent(room)}%</strong>
+            <div className="mode-switch">
+              <button
+                className={lobbyMode === "create" ? "mode-button active" : "mode-button"}
+                type="button"
+                onClick={() => setLobbyMode("create")}
+              >
+                <Plus size={16} />
+                <span>Create game</span>
+              </button>
+              <button
+                className={lobbyMode === "join" ? "mode-button active" : "mode-button"}
+                type="button"
+                onClick={() => setLobbyMode("join")}
+              >
+                <LogIn size={16} />
+                <span>Join game</span>
+              </button>
+            </div>
+
+            {lobbyMode === "create" ? (
+              <div className="lobby-stack">
+                <div className="difficulty-grid">
+                  {(Object.keys(DIFFICULTY_META) as Difficulty[]).map((option) => (
+                    <button
+                      key={option}
+                      className={difficulty === option ? "difficulty-tile active" : "difficulty-tile"}
+                      type="button"
+                      onClick={() => setDifficulty(option)}
+                    >
+                      <span>{DIFFICULTY_META[option].label}</span>
+                      <small>{DIFFICULTY_META[option].clues}</small>
+                    </button>
+                  ))}
                 </div>
+
+                <button
+                  className="primary-button wide-button"
+                  type="button"
+                  onClick={() => void createRoom()}
+                  disabled={pending}
+                >
+                  {pending ? <LoaderCircle className="spin" size={16} /> : <Plus size={16} />}
+                  <span>Create room</span>
+                </button>
+              </div>
+            ) : (
+              <div className="lobby-stack">
+                <label className="field">
+                  <span>Room code</span>
+                  <input
+                    autoFocus
+                    maxLength={6}
+                    placeholder="AB12CD"
+                    value={joinCode}
+                    onChange={(event) => setJoinCode(normalizeRoomCode(event.target.value))}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") {
+                        void joinRoom();
+                      }
+                    }}
+                  />
+                </label>
+
+                {roomId ? (
+                  <div className="invite-strip">
+                    <span>Invite detected</span>
+                    <strong>{roomId}</strong>
+                    {liveRoom ? <small>{connectedCount} online</small> : null}
+                  </div>
+                ) : null}
+
+                <button
+                  className="primary-button wide-button"
+                  type="button"
+                  onClick={() => void joinRoom()}
+                  disabled={pending}
+                >
+                  {pending ? <LoaderCircle className="spin" size={16} /> : <LogIn size={16} />}
+                  <span>Enter room</span>
+                </button>
+              </div>
+            )}
+          </div>
+        </section>
+      ) : null}
+
+      {view === "room" && room ? (
+        <section className="room-scene">
+          <header className="room-topbar">
+            <div className="brand-line">
+              <span className="room-mark">Nazoku</span>
+              <span className="room-pill">{roomId}</span>
+            </div>
+
+            <div className="room-top-actions">
+              <button className="icon-button subtle" type="button" onClick={copyRoomLink}>
+                <Copy size={16} />
+                <span>Share</span>
+              </button>
+              <button className="icon-button subtle" type="button" onClick={leaveRoom}>
+                <ArrowLeft size={16} />
+                <span>Lobby</span>
+              </button>
+            </div>
+          </header>
+
+          <div className="room-layout">
+            <section className="board-surface">
+              <div className="board-surface-head">
                 <div>
-                  <span className="metric-label">Correct</span>
-                  <strong>
-                    {room.correctCells}/{room.totalToFill}
-                  </strong>
+                  <span className="eyebrow">Live grid</span>
+                  <h1 className="surface-title">
+                    {progressPercent(room)}% solved
+                  </h1>
                 </div>
-                <div>
-                  <span className="metric-label">Started</span>
-                  <strong>{formatTime(room.startedAt)}</strong>
+
+                <div className="status-strip">
+                  <div className="status-chip">
+                    <span>Cell</span>
+                    <strong>{selectedCell !== null ? cellLabel(selectedCell) : "--"}</strong>
+                  </div>
+                  <div className="status-chip">
+                    <span>Mode</span>
+                    <strong>{notesMode ? "Notes" : "Ink"}</strong>
+                  </div>
                 </div>
               </div>
-            ) : null}
 
-            {notice || error ? (
-              <p className="status-line">{notice ?? error}</p>
-            ) : loading ? (
-              <p className="status-line">Syncing room…</p>
-            ) : null}
-          </section>
+              <SudokuBoard
+                room={room}
+                selfPlayer={selfPlayer}
+                selectedCell={selectedCell}
+                onSelectCell={setSelectedCell}
+              />
 
-          <section className="board-panel">
-            <div className="panel-head">
-              <span className="eyebrow">Board</span>
-              {room ? (
-                <div className="board-tools">
+              <div className="board-toolbar">
+                <div className="selection-chip">
+                  <span>{selectedCell !== null ? cellLabel(selectedCell) : "Cell"}</span>
+                  <strong>{selectedValue}</strong>
+                  {selectedNotes ? <small>{selectedNotes}</small> : null}
+                </div>
+
+                <div className="tool-group">
                   <button
                     className={notesMode ? "icon-button active" : "icon-button"}
                     type="button"
@@ -606,126 +1021,133 @@ export function NazokuApp() {
                     <SquarePen size={16} />
                     <span>Notes</span>
                   </button>
+                  <button
+                    className="icon-button"
+                    type="button"
+                    onClick={() => void pressDigit(null)}
+                  >
+                    <X size={16} />
+                    <span>Clear</span>
+                  </button>
                   <button className="icon-button" type="button" onClick={() => void refresh()}>
                     <RefreshCcw size={16} />
-                    <span>Sync</span>
+                    <span>{loading ? "Syncing" : "Sync"}</span>
                   </button>
                 </div>
+              </div>
+
+              <div className="keypad-grid">
+                {Array.from({ length: 9 }, (_, index) => index + 1).map((digit) => (
+                  <button
+                    key={digit}
+                    className="digit-button"
+                    type="button"
+                    onClick={() => void pressDigit(digit)}
+                  >
+                    {digit}
+                  </button>
+                ))}
+              </div>
+
+              {room.completedAt && room.winner ? (
+                <div className="completion-banner">
+                  <Crown size={16} />
+                  <span>{room.winner.playerName} finished the board.</span>
+                </div>
               ) : null}
-            </div>
+            </section>
 
-            {room ? (
-              <>
-                <SudokuBoard
-                  room={room}
-                  selfPlayer={selfPlayer}
-                  selectedCell={selectedCell}
-                  onSelectCell={setSelectedCell}
-                />
+            <aside className="room-sidebar">
+              <section className="sidebar-surface">
+                <span className="eyebrow">Overview</span>
+                <div className="metric-grid">
+                  <div className="metric-tile">
+                    <span>Correct</span>
+                    <strong>
+                      {room.correctCells}/{room.totalToFill}
+                    </strong>
+                  </div>
+                  <div className="metric-tile">
+                    <span>Online</span>
+                    <strong>{connectedCount}</strong>
+                  </div>
+                  <div className="metric-tile">
+                    <span>Started</span>
+                    <strong>{formatTime(room.startedAt)}</strong>
+                  </div>
+                  <div className="metric-tile">
+                    <span>Left</span>
+                    <strong>{room.totalToFill - room.correctCells}</strong>
+                  </div>
+                </div>
 
-                <div className="keypad">
-                  {Array.from({ length: 9 }, (_, index) => index + 1).map((digit) => (
+                <div className="difficulty-grid compact-grid">
+                  {(Object.keys(DIFFICULTY_META) as Difficulty[]).map((option) => (
                     <button
-                      key={digit}
-                      className="digit-button"
+                      key={option}
+                      className={difficulty === option ? "difficulty-tile active" : "difficulty-tile"}
                       type="button"
-                      onClick={() => void pressDigit(digit)}
+                      onClick={() => void remixPuzzle(option)}
                     >
-                      {digit}
+                      <span>{DIFFICULTY_META[option].label}</span>
+                      <small>{DIFFICULTY_META[option].pulse}</small>
                     </button>
                   ))}
-                  <button className="digit-button utility" type="button" onClick={() => void pressDigit(null)}>
-                    <X size={16} />
-                  </button>
+                </div>
+              </section>
+
+              <section className="sidebar-surface">
+                <div className="sidebar-head">
+                  <span className="eyebrow">Players</span>
+                  <div className="live-pill">
+                    <Users size={14} />
+                    <span>{connectedCount}</span>
+                  </div>
                 </div>
 
-                {room.completedAt && room.winner ? (
-                  <div className="completion-banner">
-                    <Crown size={16} />
-                    <span>{room.winner.playerName} closed the grid.</span>
-                  </div>
-                ) : null}
-              </>
-            ) : (
-              <div className="board-placeholder">
-                <span>Open a room to start the shared grid.</span>
-              </div>
-            )}
-          </section>
+                <div className="player-list">
+                  {room.players.map((entry, index) => (
+                    <div className="player-line" key={entry.playerId}>
+                      <div className="player-left">
+                        <span className="player-rank">{index + 1}</span>
+                        <span
+                          className="player-swatch"
+                          style={{ backgroundColor: entry.playerColor }}
+                          aria-hidden="true"
+                        />
+                        <div>
+                          <strong>{entry.playerName}</strong>
+                          <small>{entry.connected ? "online" : "away"}</small>
+                        </div>
+                      </div>
 
-          <section className="panel">
-            <div className="panel-head">
-              <span className="eyebrow">Players</span>
-              {room ? (
-                <button
-                  className="secondary-button compact"
-                  type="button"
-                  onClick={() => void remixPuzzle(difficulty)}
-                >
-                  <RefreshCcw size={14} />
-                  <span>Remix</span>
-                </button>
-              ) : null}
-            </div>
-
-            <div className="players-list">
-              {room?.players.map((entry) => (
-                <article className="player-row" key={entry.playerId}>
-                  <div className="player-meta">
-                    <span
-                      className="player-swatch"
-                      style={{ backgroundColor: entry.playerColor }}
-                      aria-hidden="true"
-                    />
-                    <div>
-                      <strong>{entry.playerName}</strong>
-                      <small>{entry.connected ? "online" : "away"}</small>
+                      <div className="player-right">
+                        <span>{entry.correctMoves}</span>
+                        <small>{entry.errors} misses</small>
+                      </div>
                     </div>
-                  </div>
+                  ))}
+                </div>
 
-                  <div className="player-stats">
-                    <span>{entry.correctMoves} solved</span>
-                    <span>{entry.errors} misses</span>
-                  </div>
-                </article>
-              )) ?? <p className="muted-line">No players yet.</p>}
-            </div>
-
-            <div className="activity-list">
-              {room?.activity.map((item) => (
-                <article className="activity-row" key={item.id}>
-                  <span
-                    className="activity-line"
-                    style={{ backgroundColor: item.actorColor }}
-                    aria-hidden="true"
-                  />
-                  <div>
-                    <strong>{item.label}</strong>
-                    <small>{formatTime(item.createdAt)}</small>
-                  </div>
-                </article>
-              )) ?? <p className="muted-line">Fresh room activity lands here.</p>}
-            </div>
-          </section>
-        </section>
-      </section>
-
-      {showJoinOverlay ? (
-        <section className="join-overlay">
-          <div className="join-sheet">
-            <span className="eyebrow">Join room {roomId}</span>
-            <h2>Claim your seat on the grid.</h2>
-            <p>
-              The room exists. Enter with a fresh player profile or reuse your
-              stored identity on this device.
-            </p>
-            <button className="primary-button" type="button" onClick={joinRoom} disabled={pending}>
-              <Users size={16} />
-              <span>Enter room</span>
-            </button>
+                {error ? <p className="muted-line">{error}</p> : null}
+              </section>
+            </aside>
           </div>
         </section>
       ) : null}
+
+      <div className="toast-stack" aria-live="polite" aria-atomic="true">
+        {toasts.map((toast) => (
+          <button
+            key={toast.id}
+            className={`toast toast-${toast.tone}`}
+            type="button"
+            onClick={() => dismissToast(toast.id)}
+          >
+            <span>{toast.message}</span>
+          </button>
+        ))}
+      </div>
     </main>
   );
 }
